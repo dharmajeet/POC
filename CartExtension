@@ -1,0 +1,27 @@
+using CartService.DTO;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CartService
+{
+    public static class CartExtension
+    {
+        public static decimal CalculatePrice(this IList<ProductBase> cartItems, IDiscountService discountService)
+        {
+            var toralPrice = cartItems.Sum(item => item.ProductPrice.Price);
+
+            decimal discountedPrice = decimal.Zero;
+            foreach (var discountedItems in discountService.GetDiscountedProduct(cartItems.Select(item => item.Code).Distinct().ToArray()))
+            {
+                var productInCart = cartItems.Where(item => item.Code == discountedItems.Key);
+                if (productInCart?.Any() ?? false)
+                    discountedPrice += discountedItems.Value.CalculateDiscount(productInCart);
+            }
+
+            return toralPrice - discountedPrice;
+        }
+    }
+}
