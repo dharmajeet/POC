@@ -1,0 +1,452 @@
+using Newtonsoft.Json.Linq;
+using OpenApiClientLib.Contract;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace OpenApiClientLib.JsonService
+{
+    /// <summary>
+    /// This class file is used to parse the json content and return data in 2D array format
+    /// </summary>
+    public class JsonConverterService : IJsonConverterService
+    {
+        private const string PropertySeperator = ".";
+        private const string JsonArraySimbol = "[]";
+        private const char JsonArrayPostFixSimbol = ']';
+        private const string ArrayFirstIndexSimbol = "[0]";
+
+        private const string RegexExpresionToFindArray = @"(?<!\[\d+\])(\[\d+\])(?!\[\d+\])";
+
+
+        private IStrategyProvider _strategyProvider;
+
+        /// <summary>
+        /// Regex to find pattern in string
+        /// </summary>
+        private static Regex _regex;
+
+
+        /// <summary>
+        /// Constructer
+        /// </summary>
+        static JsonConverterService()
+        {
+            _regex = new Regex(RegexExpresionToFindArray);
+        }
+
+        /// <summary>
+        /// Constructor with strategy provider as parameter
+        /// </summary>
+        /// <param name="strategyProvider"></param>
+        public JsonConverterService(IStrategyProvider strategyProvider)
+        {
+            _strategyProvider = strategyProvider;
+        }
+
+
+
+
+        /// <summary>
+        /// Generate 2D array with json data for requested properties
+        /// </summary>
+        /// <param name="jtoken"></param>
+        /// <param name="requestedColumns"></param>
+        /// <param name="url"></param>
+        /// <returns>2D array with corresponding Json data</returns>
+        public async Task<object[,]> ConvertJsonHierarchyTo2DArray(JToken jtoken, List<string> requestedColumns, string url, string uniqueKey = "", string uniqueValue = "")
+        {
+          
+            ArrayDataStrategy arrayDatastrategy =_strategyProvider.GetArrayDataStrategy(url);
+            var token = GetTokenForStrategy(arrayDatastrategy, jtoken, uniqueKey, uniqueValue);
+            // Applying special case for Array type object. Adding Root Object name in requestedColumns to iterate over all peoperties
+            if (token["Data"] != null && requestedColumns.Count(obj => obj.Contains("Data[]")) == 0)
+            {
+                List<string> modifiedRequestedProperties = new List<string>();
+                foreach (var property in requestedColumns)
+                {
+                    modifiedRequestedProperties.Add("Data[]." + property);
+                }
+                requestedColumns = modifiedRequestedProperties;
+            }
+
+            Dictionary<string, string> requestedProperties = requestedColumns.Distinct().ToDictionary(obj => obj, obj => obj);
+
+            /// <summary>
+            /// Data would be like below:
+            /// _allColumns[0]= List<string> {"Uic"}
+            /// _allColumns[1]= List<string> {"Orders[0].orderId","Orders[1].orderId"}
+            /// /// _allColumns[2]= List<string> {"Instruments[0]","Instruments[1]"}
+            /// </summary>
+            var allColumns = new List<Dictionary<string, List<string>>>();
+
+            /// <summary>
+            /// Data would be like below:
+            /// List<string> {"Uic","Orders[0].PlacedDate","Orders[1].PlacedDate"}
+            /// </summary>
+            var allSiblingColumns = new Dictionary<string, List<string>>();
+
+            /// <summary>
+            /// Data would be like below:
+            /// _allRowsQueries[0]= List<string> {"Uic","Orders[0].orderId","Instruments[0]"}
+            /// _allRowsQueries[1]= List<string>{"Uic","Orders[0].orderId","Instruments[1]"}
+            /// _allRowsQueries[2]= List<string> {"Uic","Orders[1].orderId","Instruments[0]"}
+            ///  /// _allRowsQueries[2]= List<string> {"Uic","Orders[1].orderId","Instruments[1]"}
+            /// </summary>         
+            var allRowsQuery = new List<Dictionary<string, string>>();
+            Dictionary<string, string> jsonData = new Dictionary<string, string>();
+            // Read json content and prepare columns and sibling columns. Required Json properties will be added allColumns list and sibling property will be added in allSiblingColumns
+            await ReadJsonData(token, requestedProperties, allColumns, allSiblingColumns, jsonData);
+            var allPreparedColumn = allColumns.SelectMany(obj => obj.Select(dict => dict.Value)).ToList();
+            //Console.WriteLine();
+
+            // Check if requested property found in Json object
+            if (allColumns.Count > 0)
+            {
+                //Json Queries will be added in allRowsQuery list object
+                PrepareJsonQuery(allPreparedColumn, allSiblingColumns, allRowsQuery, string.Empty, 0, new List<string>());
+                return PrintJsonDataInTableFormat(requestedColumns, allRowsQuery, token, jsonData);
+            }
+            else
+                return new object[1, requestedColumns.Count];
+        }
+
+        private JToken GetTokenForStrategy(ArrayDataStrategy dataStrategy,JToken jToken,string uniqueKey, string uniqueValue)
+        {
+            JToken updatedToken;
+            if (dataStrategy.ShouldDataTokenBeCloned)
+            {
+
+                var newToken = jToken.DeepClone();
+                if (!string.IsNullOrEmpty(uniqueValue))
+                {
+                    newToken["Data"]?.Children().Where(p => ((JObject)p).GetValue(uniqueKey, StringComparison.InvariantCultureIgnoreCase).ToString() != uniqueValue).ToList().ForEach(
+                     token => { token.Remove(); }
+                    );
+                }
+                updatedToken = newToken;
+            }
+            else
+            {
+                 updatedToken = jToken;
+            }
+            return updatedToken;
+        }
+
+        #region private methods for ConvertJsonHierarchyTo2DArray
+
+
+        /// <summary>
+        /// Execute json query and prepare result in 2D array
+        /// </summary>
+        private object[,] PrintJsonDataInTableFormat(List<string> requestedPrperties, List<Dictionary<string, string>> allRowsQueries, JToken jsonObject, Dictionary<string, string> jsonData)
+        {
+            // Create 2D array with Rows count = result row count and column= requested column count
+            object[,] result = new object[allRowsQueries.Count, requestedPrperties.Count];
+
+            var row = result.GetLength(0);
+            var col = requestedPrperties.Count;
+            // Iterate over result rows
+            for (int rowIndex = 0; rowIndex < row; rowIndex++)
+            {
+                // Get current row json query
+                var currentRowQuery = allRowsQueries[rowIndex];
+                for (int colIndex = 0; colIndex < col; colIndex++)
+                {
+                    var columnQuery = string.Empty;
+                    var jsonValue = string.Empty;
+                    result[rowIndex, colIndex] = string.Empty;
+                    currentRowQuery.TryGetValue(requestedPrperties[colIndex], out columnQuery);
+                    if (!string.IsNullOrEmpty(columnQuery))
+                    {
+                        if (jsonData.TryGetValue(columnQuery, out jsonValue))
+                        {
+                            result[rowIndex, colIndex] = jsonValue;
+                        }
+                    }
+
+                }
+            }
+            return result;
+        }
+
+
+        /// <summary>
+        /// Read Json file and create Json selector for all property, the selector will be in parent and child sequence order
+        /// </summary>
+        /// <param name="jsonContent">Json file raw content</param>
+        /// <param name="requestedProperties">User request properties</param>
+        /// <param name="allColumns">Using as out parameter</param>
+        /// <param name="allSiblingColumns">Using as out parameter</param>
+        /// <returns>Json Object</returns>
+        private async Task ReadJsonData(JToken jTokenObject, Dictionary<string, string> requestedProperties, List<Dictionary<string, List<string>>> allColumns, Dictionary<string, List<string>> allSiblingColumns, Dictionary<string, string> jsonData)
+        {
+            JObject jsonObject = jTokenObject as JObject;
+            Dictionary<string, string> allSiblings = new Dictionary<string, string>();
+            Dictionary<string, string> siblingsWithoutIndexer = new Dictionary<string, string>();
+            IEnumerable<JToken> jTokens = jsonObject.Descendants().Where(p => p.Count() == 0);
+            // Iterating over json property Sequentially   
+            jTokens.Aggregate(new Dictionary<string, string>(), (properties, jToken) =>
+            {
+                if (!allSiblings.ContainsKey(jToken.Path))
+                {
+                    //  Console.WriteLine(jToken.Path);
+                    // Replacing Indexer from array selector. like [0] or [1].. will be like [] or []..
+                    var columnName = _regex.Replace(jToken.Path, JsonArraySimbol);
+
+                    if (!siblingsWithoutIndexer.ContainsKey(columnName.ToUpperInvariant()))
+                    {
+                        // Checking column is already in _allColumns list. the list will contain data like mention below
+                        // [0]= { "Uic[0]", "Uic{1}"}
+                        // [1]= { "Orders[0].OrderId", "Orders[1].OrderId"}
+                        // Every Child level will have seperate list (and same level sibling property will in other list)
+                        // Checking column by replacing indexer from selector so that column selector can mathech with same level selector for same parent
+                        List<string> uniqColumn = null;
+                        var columnDictionary = allColumns.Where(dict => dict.ContainsKey(columnName)).FirstOrDefault();
+                        if (columnDictionary != null)
+                        {
+                            columnDictionary.TryGetValue(columnName, out uniqColumn);
+                        }
+                        //var uniqColumn = allColumns.Where(obj => obj.Count(col => _regex.Replace(col, JsonArraySimbol).Equals(columnName, StringComparison.OrdinalIgnoreCase)) > 0).FirstOrDefault();
+
+                        // If unique column then add in column list
+                        if (uniqColumn != null)
+                        {
+                            uniqColumn.Add(jToken.Path);
+                            FindAndAddSiblings((JValue)jToken, allSiblingColumns, jToken.Path, jsonData, allSiblings, siblingsWithoutIndexer);
+                            FillDataInDictionary(jsonData, jToken.Path, jToken);
+                        }
+                        else
+                        {
+                            string tokenPath = jToken.Path.Trim();
+                            if (jToken.GetType() == typeof(JValue))
+                            {
+                                if (requestedProperties.ContainsKey(columnName))
+                                {
+                                    var newColumnDictionary = new Dictionary<string, List<string>>
+                                {
+                                    { columnName, new List<string>() { tokenPath } }
+                                };
+                                    allColumns.Add(newColumnDictionary);
+                                    FindAndAddSiblings((JValue)jToken, allSiblingColumns, tokenPath, jsonData, allSiblings, siblingsWithoutIndexer);
+                                    FillDataInDictionary(jsonData, tokenPath, jToken);
+                                }
+                            }
+                            else if (jToken.GetType() == typeof(JArray) && tokenPath[tokenPath.Length - 1] != JsonArrayPostFixSimbol)
+                            {
+                                tokenPath = string.Concat(tokenPath, ArrayFirstIndexSimbol);
+                                var pathWithoutIndexer = _regex.Replace(tokenPath, JsonArraySimbol);
+
+                                if (requestedProperties.ContainsKey(_regex.Replace(tokenPath, JsonArraySimbol)))
+                                {
+                                    columnDictionary = allColumns.Where(dict => dict.ContainsKey(pathWithoutIndexer)).FirstOrDefault();
+                                    if (columnDictionary != null)
+                                    {
+                                        columnDictionary.TryGetValue(pathWithoutIndexer, out uniqColumn);
+                                    }
+
+                                    // Checking column by replacing indexer from selector so that column selector can mathech with same level selector for same parent
+                                    //uniqColumn = allColumns.Where(obj => obj.Count(col => _regex.Replace(col, JsonArraySimbol).Equals(pathWithoutIndexer, StringComparison.OrdinalIgnoreCase)) > 0).FirstOrDefault();
+
+                                   
+
+                                    // If unique column then add in column list
+                                    if (uniqColumn != null)
+                                    {
+                                        uniqColumn.Add(tokenPath);
+                                    }
+                                    else
+                                    {
+                                        var newColumnDictionary = new Dictionary<string, List<string>>
+                                    {
+                                         { pathWithoutIndexer, new List<string>() { tokenPath } }
+                                    };
+                                        allColumns.Add(newColumnDictionary);
+
+
+                                    }
+                                }
+
+
+                            }
+                        }
+                    }
+                }
+                return properties;
+            });
+
+        }
+
+        /// <summary>
+        /// Find property sibling and add in sibling list. Fill Sibling values in data list
+        /// </summary>
+        /// <param name="jTokenObject"></param>
+        /// <param name="allSiblingColumns"></param>
+        /// <param name="elderProperty"></param>
+        /// <param name="jsonData"></param>
+        /// <returns></returns>
+        private Dictionary<string, List<string>> FindAndAddSiblings(JValue jToken, Dictionary<string, List<string>> allSiblingColumns, string elderProperty, Dictionary<string, string> jsonData, Dictionary<string, string> allSiblings, Dictionary<string, string> allSiblingWithoutIndexer)
+        {
+            List<string> siblingProperties;
+            if (!allSiblingColumns.TryGetValue(elderProperty, out siblingProperties))
+            {
+                siblingProperties = new List<string>();
+                allSiblingColumns[elderProperty] = siblingProperties;
+            }
+            if (jToken.Parent.GetType() != typeof(JArray))
+            {
+                JProperty jObject = (JProperty)jToken.Parent;
+
+                while (jObject.Next != null)
+                {
+                    var obj = jObject.Next;
+                    if (((JProperty)jObject.Next).Value.GetType() != typeof(JArray) && ((Newtonsoft.Json.Linq.JProperty)jObject.Next).Value.GetType() != typeof(JObject))
+                    {
+                        JProperty prop = (JProperty)jObject.Next;
+                        siblingProperties.Add(prop.Path);
+
+                        if (!allSiblings.ContainsKey(prop.Path))
+                        {
+                            allSiblings[prop.Path] = elderProperty;
+                        }
+                        var pathWithoutInedxer = _regex.Replace(prop.Path, "[]").ToUpperInvariant();
+                        if (!allSiblingWithoutIndexer.ContainsKey(pathWithoutInedxer))
+                        {
+                            allSiblingWithoutIndexer.Add(pathWithoutInedxer, prop.Path);
+                        }
+                        FillDataInDictionary(jsonData, prop.Path, prop);
+
+                    }
+                    jObject = (JProperty)jObject.Next;
+
+                }
+            }
+            return allSiblingColumns;
+        }
+        private void FillDataInDictionary(Dictionary<string, string> jsonData, string key, JToken data)
+        {
+            var value = string.Empty;
+            try
+            {
+                if (data is JProperty)
+                {
+                    value = ((JProperty)data).Value?.ToString();
+                }
+                else
+                {
+                    value = ((JValue)data).Value?.ToString();
+                }
+
+            }
+            catch { }
+
+            jsonData.Add(key, value);
+        }
+        #endregion   
+        
+         public void PrepareJsonQuery(List<List<string>> allColumns, Dictionary<string, List<string>> allSiblingColumns, List<Dictionary<string, string>> allRowsQueries, string query, int columnIndex, List<string> currentRowQueryResult)
+        {
+            allColumns = allColumns.OrderBy(list => list.Count).ToList();
+            int currentRowIndex = 0;
+            base.PrepareJsonQuery(allColumns, allSiblingColumns, allRowsQueries, query, columnIndex, currentRowQueryResult, ref currentRowIndex);
+        }
+    }
+}
+
+
+  public interface IJsonConverterService
+    {
+        /// <summary>
+        /// Conver complex json to 2D array
+        /// </summary>
+        /// <param name="jtoken"></param>
+        /// <param name="requestedColumns"></param>
+        /// <param name="url"></param>
+        /// <returns>2D array of data</returns>
+        Task<object[,]> ConvertJsonHierarchyTo2DArray(JToken jtoken, List<string> requestedColumns,string url,string uniqueID, string uniqueValue);
+    }
+
+
+
+
+                    }
+ [TestMethod]
+        public void Test_Convert_JsonArray_Hierarchy_To_2D_Array()
+        {
+            Assert.IsTrue(!string.IsNullOrEmpty(_jsonArraySnapshotFilePath), "Original Json file ArraySnapshot path is empty");
+            Assert.IsTrue(File.Exists(_jsonArraySnapshotFilePath), "Original Json file ArraySnapshot not found at path" + _jsonArraySnapshotFilePath);
+
+            var jsonContent = string.Concat(File.ReadAllLines(_jsonArraySnapshotFilePath));
+            var requestedColumn = new List<string>();
+
+            requestedColumn.AddRange(new string[] { "Description", "MinAmountUSD", "Name", "Parameters[]", "SupportedDurationTypes[]", "TradableInstrumentTypes[]" });
+
+            var expectedResult = Expected_Result_For_Test_Convert_JsonArray_Hierarchy_To_2D_Array();
+            var result = _jsonConverterService.ConvertJsonHierarchyTo2DArray(JToken.Parse(jsonContent), requestedColumn,"","","").Result;
+
+            var equal =
+                    expectedResult.Rank == result.Rank &&
+                    Enumerable.Range(0, expectedResult.Rank).All(dimension => expectedResult.GetLength(dimension) == result.GetLength(dimension)) &&
+                   StructuralCompare(expectedResult.Cast<string>().ToList(), result.Cast<string>().ToList());
+            Assert.IsTrue(equal, "Output of Test_Convert_JsonArray_Hierarchy_To_2D_Array is not matched with expected result");
+
+        }
+        
+        
+        
+        
+  /*
+  
+  Sample json data for flaton
+  {
+  "Uic": 1,
+  "Orders": [
+    {
+      "OrderId": 1,
+      "LegOrders": [
+        {
+          "OrderId": 12,
+          "PlacedDate": 12,
+          "Owner": "12- Xdhay",
+          "Instruments": [ "FxSpot", "CfdOnStock" ]
+        },
+        {
+          "OrderId": 13,
+          "PlacedDate": 13,
+          "Owner": "13- Xdhay",
+          "Instruments": [ "CfdOnStock" ]
+        }
+      ],
+      "PlacedDate": 5,
+      "Owner": "Dharmajeet"
+    },
+    {
+      "OrderId": 2,
+      "LegOrders": [
+        {
+          "OrderId": 21,
+          "PlacedDate": 21,
+          "Owner": "21-Dharmajeet Yadav",
+          "Instruments": []
+        },
+        {
+          "OrderId": 22,
+          "PlacedDate": 22,
+          "Owner": "22-Dharmajeet Yadav",
+          "Instruments": [ "FxSpot", "CfdOnStock" ]
+        }
+      ],
+      "PlacedDate": 6,
+      "Owner": "Dharmajeet Yadav"
+    }
+  ],
+  "Instruments": [
+    "FxSpot",
+    "CfdOnStock"
+  ],
+  "SpecificOption": "Test"
+}
+  
+  */      
